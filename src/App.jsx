@@ -1,7 +1,13 @@
 import { useState, useRef, useCallback } from 'react'
 import * as XLSX from 'xlsx'
 import ExcelJS from 'exceljs/dist/exceljs.min.js'
+import JSZip from 'jszip'
+import { PDFDocument } from 'pdf-lib'
+import * as pdfjsLib from 'pdfjs-dist'
+import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import './App.css'
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker
 
 function extractMonthYear(periodStr) {
   if (!periodStr || typeof periodStr !== 'string') return { month: '', year: '' }
@@ -166,7 +172,7 @@ async function buildWorkbook(nominaRows, essaludRows, baseRows) {
     buildSheet(wb, name, ed, es, month, year, afp)
   }
 
-  return wb
+  return { wb, empOrder }
 }
 
 function buildSheet(wb, name, ed, es, month, year, afp) {
@@ -184,11 +190,9 @@ function buildSheet(wb, name, ed, es, month, year, afp) {
   ws.getRow(10).height = 28.5
   for (let r = 27; r <= 36; r++) ws.getRow(r).height = 15.6
 
-  // Row 1: Title A-J + Image area K-L
+  // Row 1: Title A-L
   sc(ws, 1, 1, 'BOLETA DE PAGO', FONT_TITLE, FILL_WHITE, ALIGN_CENTER)
-  merge(ws, 1, 1, 1, 10)
-  sc(ws, 1, 11, '', FONT_TITLE, FILL_WHITE)
-  merge(ws, 1, 11, 1, 12)
+  merge(ws, 1, 1, 1, 12)
 
   // Row 2
   sc(ws, 2, 1, 'EMPRESA', FONT_HEADER, FILL_GRAY, ALIGN_LEFT)
@@ -324,6 +328,7 @@ function buildSheet(wb, name, ed, es, month, year, afp) {
   sc(ws, 25, 9, 'TOTAL APORTE EMPLEADOR', FONT_HEADER, FILL_GRAY, ALIGN_LEFT)
   merge(ws, 25, 9, 25, 11)
   scNum(ws, 25, 12, r2(tae), FONT_DATA_LG, FILL_WHITE)
+  ws.getCell(25, 1).border = { ...ws.getCell(25, 1).border, left: BORDER }
 
   // Row 26: Totals
   const tr = ed.conceptos.reduce((s, c) => s + c.valorDevengado, 0)
@@ -362,18 +367,22 @@ function buildSheet(wb, name, ed, es, month, year, afp) {
   sc(ws, 36, 10, 'RECIBI CONFORME TRABAJADOR', FONT_DATA_LG, FILL_WHITE, ALIGN_LEFT, BORDER_TOP)
   merge(ws, 36, 10, 36, 12)
 
-  // Rows 27-36: right border on column L + row 36 bottom border
+  // Rows 27-36: left border on A, right border on L + row 36 bottom border
   for (let r = 27; r <= 36; r++) {
-    const cell = ws.getCell(r, 12)
-    cell.border = { ...cell.border, right: BORDER }
+    const cellA = ws.getCell(r, 1)
+    cellA.border = { ...cellA.border, left: BORDER }
+    const cellL = ws.getCell(r, 12)
+    cellL.border = { ...cellL.border, right: BORDER }
   }
   for (let c = 1; c <= 12; c++) {
     const cell = ws.getCell(36, c)
     cell.border = { ...cell.border, bottom: BORDER }
   }
 
-  // L4 and L9: right border
+  // A4, A9: left border | L4, L9: right border
+  ws.getCell(4, 1).border = { ...ws.getCell(4, 1).border, left: BORDER }
   ws.getCell(4, 12).border = { right: BORDER }
+  ws.getCell(9, 1).border = { ...ws.getCell(9, 1).border, left: BORDER }
   ws.getCell(9, 12).border = { right: BORDER }
 }
 
@@ -398,9 +407,15 @@ function App() {
   const [isGenerating, setIsGenerating] = useState(false)
   const [modal, setModal] = useState(null)
 
+  const [pdfFile, setPdfFile] = useState(null)
+  const [isSplittingPdf, setIsSplittingPdf] = useState(false)
+  const [isDraggingPdf, setIsDraggingPdf] = useState(false)
+
   const detalladoInputRef = useRef(null)
   const essaludInputRef = useRef(null)
   const baseInputRef = useRef(null)
+  const pdfInputRef = useRef(null)
+  const empOrderRef = useRef([])
 
   const handleDragOver = useCallback((e, setDragging) => {
     e.preventDefault()
@@ -439,7 +454,8 @@ function App() {
   const handleGenerate = useCallback(async () => {
     setIsGenerating(true)
     try {
-      const wb = await generarExcel(detalladoFile, essaludFile, baseFile)
+      const { wb, empOrder } = await generarExcel(detalladoFile, essaludFile, baseFile)
+      empOrderRef.current = empOrder
 
       const imgRes = await fetch('/Icono Clarke.png')
       const imgBlob = await imgRes.blob()
@@ -451,8 +467,8 @@ function App() {
       const imageId = wb.addImage({ base64, extension: 'png' })
       wb.worksheets.forEach(ws => {
         ws.addImage(imageId, {
-          tl: { col: 10, colOff: 350000, row: 0 },
-          ext: { width: 167, height: 68 }
+          tl: { col: 10, colOff: 350000, row: 0.25 },
+          ext: { width: 134, height: 54 }
         })
       })
 
@@ -488,6 +504,71 @@ function App() {
       setIsGenerating(false)
     }
   }, [detalladoFile, essaludFile, baseFile])
+
+  const handleSplitPdf = useCallback(async () => {
+    if (!pdfFile) return
+    setIsSplittingPdf(true)
+    try {
+      const arrayBuffer = await pdfFile.arrayBuffer()
+      const pdfLibBuffer = arrayBuffer.slice(0)
+
+      const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
+
+      let mes = ''
+      let ano = ''
+
+      for (let i = 1; i <= pdfDoc.numPages; i++) {
+        const page = await pdfDoc.getPage(i)
+        const textContent = await page.getTextContent()
+        const text = textContent.items
+          .map(item => item.str)
+          .filter(s => s.trim())
+          .join(' ')
+
+        if (!mes) {
+          const mesMatch = text.match(/MES\s+(\d+)/)
+          if (mesMatch) mes = mesMatch[1]
+        }
+        if (!ano) {
+          const anoMatch = text.match(/AÑO\s+(\d+)/)
+          if (anoMatch) ano = anoMatch[1]
+        }
+      }
+
+      const srcDoc = await PDFDocument.load(pdfLibBuffer)
+      const pageCount = srcDoc.getPageCount()
+      const zip = new JSZip()
+      const codes = empOrderRef.current
+
+      for (let i = 0; i < pageCount; i++) {
+        const newDoc = await PDFDocument.create()
+        const [copiedPage] = await newDoc.copyPages(srcDoc, [i])
+        newDoc.addPage(copiedPage)
+        const pdfBytes = await newDoc.save()
+
+        const codigo = codes[i] || `COD_${i + 1}`
+        const period = ano && mes ? `${ano}${mes.padStart(2, '0')}` : '000000'
+        const fileName = `CLARKEPE_${period}_Comprobantes_${codigo}.pdf`
+        zip.file(fileName, pdfBytes)
+      }
+
+      const zipBlob = await zip.generateAsync({ type: 'blob' })
+      const url = URL.createObjectURL(zipBlob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'Comprobantes_PDF.zip'
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+
+      setModal({ type: 'success', title: 'PDF dividido correctamente', message: `Se generaron ${pageCount} archivos PDF individuales.` })
+    } catch (err) {
+      setModal({ type: 'error', title: 'Error', message: err.message || 'Error al procesar el PDF.' })
+    } finally {
+      setIsSplittingPdf(false)
+    }
+  }, [pdfFile])
 
   return (
     <div className="app">
@@ -566,8 +647,29 @@ function App() {
                 <li>
                   <span className="step-number">3</span>
                   <div>
+                    <strong>Sube la Base de Empleados</strong>
+                    <p>Adjunta el archivo Excel con los datos complementarios (AFP, etc.)</p>
+                  </div>
+                </li>
+                <li>
+                  <span className="step-number">4</span>
+                  <div>
                     <strong>Genera los Comprobantes</strong>
-                    <p>Haz clic en Generar para descargar el archivo de comprobantes de pago</p>
+                    <p>Haz clic en Generar para descargar el archivo Excel con las boletas de pago</p>
+                  </div>
+                </li>
+                <li>
+                  <span className="step-number">5</span>
+                  <div>
+                    <strong>Exporta el Excel como PDF</strong>
+                    <p>Abre el archivo generado en Excel y guárdalo como PDF (Archivo → Guardar como → PDF)</p>
+                  </div>
+                </li>
+                <li>
+                  <span className="step-number">6</span>
+                  <div>
+                    <strong>Divide el PDF</strong>
+                    <p>Sube el PDF en la sección inferior y haz clic en Dividir PDF para obtener un ZIP con los comprobantes individuales por empleado</p>
                   </div>
                 </li>
               </ol>
@@ -762,6 +864,92 @@ function App() {
                         <line x1="12" y1="15" x2="12" y2="3"/>
                       </svg>
                       Generar Comprobantes
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="card-header">
+              <h2>Dividir PDF en Comprobantes Individuales</h2>
+              <p className="description">
+                Guarda el Excel generado como PDF desde Excel y súbelo aquí para dividirlo por empleado. Cada PDF se nombrará como CLARKEPE_AAAAMM_Comprobantes_CÓDIGO.pdf
+              </p>
+            </div>
+            <div className="card-body">
+              <div className="form-section">
+                <div className="form-group">
+                  <label className="label">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                      <polyline points="14 2 14 8 20 8"/>
+                    </svg>
+                    PDF de Comprobantes
+                  </label>
+                  <input ref={pdfInputRef} type="file" accept=".pdf" className="file-input" id="pdf-file" onChange={(e) => handleFileSelect(e, setPdfFile)} />
+                  <div
+                    className={`drop-zone ${isDraggingPdf ? 'drag-active' : ''} ${pdfFile ? 'has-file' : ''}`}
+                    onClick={() => pdfInputRef.current?.click()}
+                    onDragOver={(e) => handleDragOver(e, setIsDraggingPdf)}
+                    onDragLeave={(e) => handleDragLeave(e, setIsDraggingPdf)}
+                    onDrop={(e) => handleDrop(e, setIsDraggingPdf, setPdfFile)}
+                  >
+                    {pdfFile ? (
+                      <div className="file-preview">
+                        <div className="file-icon">
+                          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                            <polyline points="14 2 14 8 20 8"/>
+                            <line x1="16" y1="13" x2="8" y2="13"/>
+                            <line x1="16" y1="17" x2="8" y2="17"/>
+                          </svg>
+                        </div>
+                        <div className="file-details">
+                          <div className="file-name">{pdfFile.name}</div>
+                          <div className="file-size">{formatFileSize(pdfFile.size)}</div>
+                        </div>
+                        <button type="button" className="btn-remove" onClick={(e) => { e.stopPropagation(); handleRemoveFile(setPdfFile, pdfInputRef) }} title="Eliminar archivo">
+                          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <line x1="18" y1="6" x2="6" y2="18"/>
+                            <line x1="6" y1="6" x2="18" y2="18"/>
+                          </svg>
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="drop-zone-content">
+                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                          <polyline points="17 8 12 3 7 8"/>
+                          <line x1="12" y1="3" x2="12" y2="15"/>
+                        </svg>
+                        <div className="drop-zone-text">
+                          <span className="drop-zone-title">Arrastra aquí el PDF</span>
+                          <span className="drop-zone-subtitle">o haz clic para seleccionar</span>
+                        </div>
+                        <span className="drop-zone-hint">Formato aceptado: .pdf</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <button className="btn-primary" onClick={handleSplitPdf} disabled={!pdfFile || isSplittingPdf}>
+                  {isSplittingPdf ? (
+                    <>
+                      <svg className="spinner" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+                      </svg>
+                      Dividiendo PDF...
+                    </>
+                  ) : (
+                    <>
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                        <polyline points="7 10 12 15 17 10"/>
+                        <line x1="12" y1="15" x2="12" y2="3"/>
+                      </svg>
+                      Dividir PDF
                     </>
                   )}
                 </button>
