@@ -145,11 +145,26 @@ async function buildWorkbook(nominaRows, essaludRows, baseRows) {
     })
   }
 
+  // Find header row (skip empty rows)
+  let essHeaderRow = 0
+  for (let i = 0; i < essaludRows.length; i++) {
+    if (essaludRows[i] && essaludRows[i].includes('EMPLEADO')) {
+      essHeaderRow = i
+      break
+    }
+  }
+  const essHeaders = essaludRows[essHeaderRow]
+  const essEmpCol = essHeaders.indexOf('EMPLEADO')
+  const essAporteCol = essHeaders.indexOf('APORTE A ESSALUD')
+  const essCreditoCol = essHeaders.lastIndexOf('CREDITO EPS')
+  const essTotalCol = essHeaders.indexOf('ESSALUD TOTAL')
+
   const essMap = {}
-  for (const row of essaludRows.slice(1)) {
-    const c = String(row[1] || '').trim()
+  for (let i = essHeaderRow + 1; i < essaludRows.length; i++) {
+    const row = essaludRows[i]
+    const c = String(row[essEmpCol] || '').trim()
     if (!c) continue
-    essMap[c] = { aporteEssalud: row[6], creditoEpsTrab: row[7], totalAportes: row[8] }
+    essMap[c] = { aporteEssalud: row[essAporteCol], creditoEpsTrab: row[essCreditoCol], totalAportes: row[essTotalCol] }
   }
 
   // AFP map from Base Empleados
@@ -289,7 +304,7 @@ function buildSheet(wb, name, ed, es, month, year, afp) {
   const dev = ed.conceptos.filter(c => c.valorDevengado > 0)
   const ded = ed.conceptos.filter(c => c.valorDeduccion > 0)
 
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < Math.max(3, dev.length, ded.length); i++) {
     const r = 12 + i
     if (i < dev.length) {
       const c = dev[i]
